@@ -1,0 +1,182 @@
+A race condition is an undesirable situation that occurs when a device or system attempts to perform two or more operations at the same time, the operations need to be done in the sequence inorder to be done correctly. Similarly in our device also we have critical regions. We ensured that they are done correctly by using semaphores sem1 and sem2.
+
+Critical Regions in our device are the places where the device structure data count1, count2, mode and device buffer ramdisk are accessed/updated. Since across multiple vfs entry points, these device structure data can be accessed/updated, we protected them using semaphores in our device, to avoid race conditions.
+
+So, overall the critical regions in our code are read/write buffers, updating the count1 and count2 and changing the mode. If we look into the code, these are protected using sem1.
+
+Below is the brief overview of the VFS entry points of the device
+Note: Since we are using down_interruptible, if any process/thread couldn't acquire the semaphore, it waits there, until it acquire it. 
+
+e2_open
+    1. It acquires sem1
+    2. If device is in MODE1, 
+        It adds 1 to count1
+        Releases sem1
+        Acquire sem2
+        exit from open
+    3. ELSE If device is in MODE2,
+        It updates count2
+        Releases sem1
+    4. exit from open
+
+e2_release
+    1. It acquires sem1
+    2. If device is in MODE1, 
+        It subtracts 1 from count1
+        checks if count1 == 1, if yes executes wakeup on queue1.
+        Releases sem2
+    3. ELSE If device is in MODE2,
+        It subtracts 1 from count2
+        checks if count2 == 1, if yes executes wakeup on queue2.
+    4. Releases sem1
+    5. exit from release
+
+e2_write
+    1. It acquires sem1
+    2. If device is in MODE1, 
+        Release sem1
+        Writes the data to device buffer form input buffer if space is available. 
+        exit from write
+    3. Else If device is in MODE2,
+        Writes the data to device buffer form input buffer if space is available. 
+    4. Releases sem1
+    5. Exit from write
+
+e2_read
+    1. It acquires sem1
+    2. If device is in MODE1, 
+        Release sem1
+        Reads the data from device buffer to output buffer if space is available. 
+        exit from read
+    3. Else If device is in MODE2,
+        Reads the data from device buffer to output buffer if space is available.
+    4. Releases sem1
+    5. Exit from read
+
+e2_ioctl
+    1. It acquires sem1
+    2. If given input MODE and current MODE of the device are same
+        release sem1
+        exit from ioctl
+    3. If given input MODE and current MODE of the device are different
+        check if we are the only process/thread who has device opened (conditon check)
+        If yes, do changes accordingly
+        else
+            release sem1
+            wait in the corresponding MODE queue. 
+    4. Exit from Ioctl
+    Note: In step 3 else part runs in a loop, where it acquires sem1 before checking the condition again.
+          In step 3 if the conition check is true, then depending on the mode change locks are released and acquired. 
+
+
+If we observe the above the functions, whenever any VFS entry point is accessing the device structure data, it is holding sem1, except while doing a read or write in MODE1. 
+In MODE1 multiple instances of opening the device is taken care by using sem2. Only the process who acquires sem2 can access other VFS entry points in MODE1. So this will not trigger a race conditon. The critical region code which takes care of this is
+    if (devc->mode == MODE1) {
+        devc->count1++;
+        up(&devc->sem1);
+        down_interruptible(&devc->sem2);
+        return 0;
+    }
+
+Since in MODE1 multiple process can open the file and can execute reads and writes, sem1 takes care that all these multiple reads/writes occur sequentially, but the order is not guaranteed.
+
+
+offset After Successful Read/Write is not Updated
+--------------------------------------------------------
+In read/write the device structure data ramdisk is accessed only if we have sem1, in case of MODE2(In MODE1 we discussed above). So the device strcture data is protected. 
+In general loff_t *f_pos for read/write is updated after a successful read and write. However in our driver, one thing i observed is offset is not at all updated. Since in mode2 multiple devices can access the read/write function at the same time, there can be a possible race condtition in the order of executing multiple reads/writes that might result in  overwritting the data  before a read or reading the same data multiple times(since next write might get executed after all reads) can occur.
+So if we add *ppos += nbytes to the code, might resolve writing to the same offset in the disk or doing multiple reads from the same offset
+
+Read critical region:
+
+    down_interruptible(&devc->sem1);
+    if (devc->mode == MODE1) {
+       up(&devc->sem1);
+           if (*f_pos + count > ramdisk_size) {
+              printk("Trying to read past end of buffer!\n");
+              return ret;
+           }
+       ret = count - copy_to_user(buf, devc->ramdisk, count);
+    }
+    else {
+          if (*f_pos + count > ramdisk_size) {
+             printk("Trying to read past end of buffer!\n");
+             up(&devc->sem1);
+             return ret;
+          }
+          ret = count - copy_to_user(buf, devc->ramdisk, count);
+      up(&devc->sem1);
+    }
+
+
+Write critical region:
+
+    down_interruptible(&devc->sem1);
+    if (devc->mode == MODE1) {
+        up(&devc->sem1);
+        if (*f_pos + count > ramdisk_size) {
+            printk("Trying to read past end of buffer!\n");
+            return ret;
+        }
+        ret = count - copy_from_user(devc->ramdisk, buf, count);
+    }
+    else {
+        if (*f_pos + count > ramdisk_size) {
+            printk("Trying to read past end of buffer!\n");
+            up(&devc->sem1);
+            return ret;
+        }
+        ret = count - copy_from_user(devc->ramdisk, buf, count);
+        up(&devc->sem1);
+    }
+
+
+IOCTL
+---------------------------------------
+Even in IOCTL, sem1 is acquired before updating the device mode or counts of the device data structure. So these device data structure variables are protected. Below critical reqion takes care of this. 
+
+Critical Region:
+
+        case E2_IOCMODE2:
+                down_interruptible(&(devc->sem1));
+                if (devc->mode == MODE2) {
+                    up(&devc->sem1);
+                    break;
+                }
+                if (devc->count1 > 1) {
+                    while (devc->count1 > 1) {
+                        up(&devc->sem1);
+                        wait_event_interruptible(devc->queue1, (devc->count1 == 1));
+                        down_interruptible(&devc->sem1);
+                    }
+                }
+                devc->mode = MODE2;
+        devc->count1--;
+        devc->count2++;
+                up(&devc->sem2);
+                up(&devc->sem1);
+                break;
+                
+        case E2_IOCMODE1:
+                down_interruptible(&devc->sem1);
+                if (devc->mode == MODE1) {
+                   up(&devc->sem1);
+                   break;
+                }
+                if (devc->count2 > 1) {
+                   while (devc->count2 > 1) {
+                       up(&devc->sem1);
+                       wait_event_interruptible(devc->queue2, (devc->count2 == 1));
+                       down_interruptible(&devc->sem1);
+                   }
+                }
+                devc->mode = MODE1;
+        devc->count2--;
+        devc->count1++;
+                down(&devc->sem2);
+                up(&devc->sem1);
+                break;
+
+
+
+Therefore all the critical regions in the code are properly protected using sem1 and sem2, inorder to avoid inconsitency in the device structure values.
