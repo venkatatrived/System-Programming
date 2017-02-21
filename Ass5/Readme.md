@@ -28,11 +28,4 @@ make apps
 
 Run any of the userapp.
 
-References:
-----------------------------------------------------------------------
-1. Class Lecture
-2. Discussions with Professor
-
-
-
 
