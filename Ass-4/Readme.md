@@ -1,6 +1,4 @@
 Assignment-4
--------------
-Venkata Trived Menta (UFID: 87371010)
 
 Problem Statement
 -----------------
